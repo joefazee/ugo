@@ -1,0 +1,289 @@
+package handlers
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
+	"github.com/CloudyKit/jet/v6"
+	"github.com/joefazee/ladiwork/data"
+	"github.com/joefazee/ugo/mailer"
+	"github.com/joefazee/ugo/urlsigner"
+	"net/http"
+	"strings"
+	"time"
+)
+
+func (h *Handler) UserLogin(w http.ResponseWriter, r *http.Request) {
+
+	defer h.App.LoadTime(time.Now())
+	err := h.App.Render.Page(w, r, "login", nil, nil)
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+	}
+}
+
+func (h *Handler) PostUserLogin(w http.ResponseWriter, r *http.Request) {
+
+	defer h.App.LoadTime(time.Now())
+	err := r.ParseForm()
+
+	if err != nil {
+		w.Write([]byte(err.Error()))
+		return
+	}
+
+	email := strings.TrimSpace(r.Form.Get("email"))
+	password := r.Form.Get("password")
+
+	user, err := h.Models.Users.GetByEmail(email)
+
+	if err != nil {
+		w.Write([]byte(err.Error()))
+		return
+	}
+
+	matches, err := user.PasswordMatches(password)
+	if err != nil {
+		w.Write([]byte("error login.."))
+		return
+	}
+
+	if !matches {
+		w.Write([]byte("error login.."))
+		return
+	}
+
+	if r.Form.Get("remember") == "remember" {
+		randomString := h.randomString(12)
+		hasher := sha256.New()
+		_, err := hasher.Write([]byte(randomString))
+		if err != nil {
+			h.App.ErrorStatus(w, http.StatusBadRequest)
+			return
+		}
+
+		sha := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+		rm := data.RememberToken{}
+		err = rm.InsertToken(user.ID, sha)
+		if err != nil {
+			h.App.ErrorStatus(w, http.StatusBadRequest)
+			return
+		}
+
+		// set cookie
+		expire := time.Now().Add(365 * 24 * 60 * 60 * time.Second)
+		cookie := http.Cookie{
+			Name:     fmt.Sprintf("_%s_remember", h.App.AppName),
+			Value:    fmt.Sprintf("%d|%s", user.ID, sha),
+			Path:     "/",
+			Expires:  expire,
+			HttpOnly: true,
+			Domain:   h.App.Session.Cookie.Domain,
+			MaxAge:   315350000,
+			Secure:   h.App.Session.Cookie.Secure,
+			SameSite: http.SameSiteStrictMode,
+		}
+		http.SetCookie(w, &cookie)
+
+		h.App.Session.Put(r.Context(), "remember_token", sha)
+
+	}
+	h.App.Session.Put(r.Context(), "userID", user.ID)
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+
+}
+
+func (h *Handler) UserLogout(w http.ResponseWriter, r *http.Request) {
+
+	if h.App.Session.Exists(r.Context(), "remember_token") {
+		rt := data.RememberToken{}
+		_ = rt.Delete(h.App.Session.GetString(r.Context(), "remember_token"))
+	}
+
+	cookie := http.Cookie{
+		Name:     fmt.Sprintf("_%s_remember", h.App.AppName),
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Now().Add(-100 * time.Hour),
+		HttpOnly: true,
+		Domain:   h.App.Session.Cookie.Domain,
+		MaxAge:   -1,
+		Secure:   h.App.Session.Cookie.Secure,
+		SameSite: http.SameSiteStrictMode,
+	}
+	http.SetCookie(w, &cookie)
+
+	h.sessionRenew(r.Context())
+	h.sessionRemove(r.Context(), "userID")
+	h.sessionRemove(r.Context(), "remember_token")
+	h.sessionDestroy(r.Context())
+	h.sessionRenew(r.Context())
+	http.Redirect(w, r, "/users/login", http.StatusSeeOther)
+}
+
+func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
+	u := data.User{
+		FirstName: "",
+		LastName:  "Joseph",
+		Email:     "aj@aj.com",
+		Active:    1,
+		Password:  "password",
+	}
+
+	v := h.App.Validator(nil)
+	u.Validate(v)
+
+	if !v.Valid() {
+		fmt.Fprintf(w, "%v", v.Errors)
+		return
+	}
+
+	id, err := h.Models.Users.Insert(u)
+	if err != nil {
+		h.App.ErrorLog.Println("Error: " + err.Error())
+		return
+	}
+
+	fmt.Fprintf(w, "%d created %s", id, u.FirstName)
+
+}
+
+func (h *Handler) Forgot(w http.ResponseWriter, r *http.Request) {
+
+	err := h.App.Render.Page(w, r, "forgot", nil, nil)
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+	}
+}
+
+func (h *Handler) PostForgot(w http.ResponseWriter, r *http.Request) {
+
+	// parse form
+	err := r.ParseForm()
+
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+		h.App.ErrorStatus(w, http.StatusBadRequest)
+		return
+	}
+
+	// verify the submitted email
+	var u *data.User
+	email := r.Form.Get("email")
+
+	u, err = u.GetByEmail(email)
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+		h.App.ErrorStatus(w, http.StatusBadRequest)
+		return
+	}
+
+	// create a link to password reset form
+	link := fmt.Sprintf("%s/users/reset-password?email=%s", h.App.Server.URL, email)
+	signer := urlsigner.Signer{
+		Secret: []byte(h.App.EncryptionKey),
+	}
+
+	signedLink := signer.GenerateTokenFromString(link)
+	h.App.InfoLog.Println("SIGNED LINK", signedLink)
+
+	var data struct {
+		Link string
+	}
+	data.Link = signedLink
+	msg := mailer.Message{
+		To:       u.Email,
+		Subject:  "Password Reset",
+		Template: "password-reset",
+		Data:     data,
+		From:     "admin@aj.com",
+	}
+
+	h.App.Mail.Jobs <- msg
+	res := <-h.App.Mail.Result
+	if res.Error != nil {
+		h.App.ErrorLog.Println(res.Error)
+		h.App.ErrorStatus(w, http.StatusBadRequest)
+		return
+	}
+
+	http.Redirect(w, r, "/users/login", http.StatusSeeOther)
+
+}
+
+func (h *Handler) ResetForgot(w http.ResponseWriter, r *http.Request) {
+
+	email := r.URL.Query().Get("email")
+	theUrl := r.RequestURI
+	testURL := fmt.Sprintf("%s%s", h.App.Server.URL, theUrl)
+
+	signer := urlsigner.Signer{
+		Secret: []byte(h.App.EncryptionKey),
+	}
+
+	if !signer.VerifyToken(testURL) {
+		h.App.ErrorLog.Println("Invalid url ", theUrl)
+		h.App.ErrorForbidden(w)
+		return
+	}
+
+	expired := signer.Expired(testURL, 60) // 60 mins
+	if expired {
+		h.App.ErrorLog.Println("link expired ", theUrl)
+		h.App.ErrorForbidden(w)
+		return
+	}
+
+	encryptedEmail, _ := h.encrypt(email)
+	vars := make(jet.VarMap)
+	vars.Set("email", encryptedEmail)
+
+	err := h.render(w, r, "reset-password", vars, nil)
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+		h.App.Error500(w)
+		return
+	}
+
+}
+
+func (h *Handler) ResetForgotPost(w http.ResponseWriter, r *http.Request) {
+
+	// parse form
+	err := r.ParseForm()
+
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+		h.App.ErrorStatus(w, http.StatusBadRequest)
+		return
+	}
+
+	email, err := h.decrypt(r.Form.Get("email"))
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+		h.App.ErrorStatus(w, http.StatusBadRequest)
+		return
+	}
+
+	var u data.User
+	user, err := u.GetByEmail(email)
+	h.App.InfoLog.Println("EMAIL ADDRESS ", email)
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+		h.App.ErrorStatus(w, http.StatusInternalServerError)
+		return
+	}
+
+	err = user.ResetPassword(user.ID, r.Form.Get("password"))
+	if err != nil {
+		h.App.ErrorLog.Println(err)
+		h.App.ErrorStatus(w, http.StatusInternalServerError)
+		return
+	}
+
+	h.App.Session.Put(r.Context(), "flash", "Password reset! You can now login")
+
+	http.Redirect(w, r, "/users/login", http.StatusSeeOther)
+
+}

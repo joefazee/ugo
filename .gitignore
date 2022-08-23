@@ -1,0 +1,6 @@
+.idea
+coverage.out
+dist/*
+coverage.out
+bin
+vendor
